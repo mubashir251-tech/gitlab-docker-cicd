@@ -1,0 +1,103 @@
+name: Docker CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: lovehashim/gitlab-docker-cicd
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test application endpoints
+        shell: bash
+        run: |
+          npm start > app.log 2>&1 &
+          APP_PID=$!
+          trap 'kill "$APP_PID" 2>/dev/null || true' EXIT
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3000/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:3000/ \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(j.status!=="success")process.exit(1);console.log("Root endpoint JSON OK")})'
+
+          curl -fsS http://127.0.0.1:3000/health \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(j.status!=="healthy")process.exit(1);console.log("Health endpoint JSON OK")})'
+
+          npm test
+
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_NAME:test" .
+
+      - name: Test Docker container
+        shell: bash
+        run: |
+          docker run -d --name cicd-test -p 3001:3000 "$IMAGE_NAME:test"
+          trap 'docker rm -f cicd-test >/dev/null 2>&1 || true' EXIT
+
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3001/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:3001/ \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(JSON.parse(s).status!=="success")process.exit(1);console.log("Container root endpoint OK")})'
+
+          curl -fsS http://127.0.0.1:3001/health \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{if(JSON.parse(s).status!=="healthy")process.exit(1);console.log("Container health endpoint OK")})'
+
+  push:
+    name: Push to Docker Hub
+    needs: build-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image tags
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
